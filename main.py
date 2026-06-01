@@ -1,19 +1,27 @@
-"""Generate a GitHub App installation access token (a ``ghs_`` token).
+"""Pull your closed pull requests via the GitHub Remote MCP server.
 
-Runs the standard 3-step GitHub App auth flow:
+Runs end to end:
 
 1. Build a short-lived JWT signed (RS256) with the app's private key.
-2. List the app's installations to find an installation id.
+2. List the app's installations to find an installation id (and account login).
 3. Exchange the JWT for an installation access token (the ``ghs_`` value).
+4. Hand that token to the GitHub Remote MCP server, complete the MCP handshake,
+   and call the ``search_pull_requests`` tool to list closed PRs.
 
-The resulting token is printed to the logs. Installation tokens expire one
-hour after creation. This is a local dev/test utility -- avoid logging tokens
-in production.
+Installation tokens expire one hour after creation, so a fresh one is minted on
+every run. This is a local dev/test utility.
+
+Note: a ``ghs_`` token authenticates as the *app installation*, not as you, so
+the search uses ``author:<login>`` explicitly (``@me`` would resolve to the bot
+and return nothing). The author defaults to the installation account; override
+it with ``GITHUB_PR_AUTHOR``.
 """
 
 import glob
+import json
 import logging
 import os
+import re
 import sys
 import time
 
@@ -30,6 +38,12 @@ logger = logging.getLogger("github-app-token")
 GITHUB_API = "https://api.github.com"
 API_VERSION = "2022-11-28"
 ACCEPT = "application/vnd.github+json"
+
+# GitHub's hosted (remote) MCP server. It forwards the bearer token straight to
+# the GitHub API, so any valid token -- including a ``ghs_`` installation token
+# -- works here.
+MCP_ENDPOINT = "https://api.githubcopilot.com/mcp/"
+MCP_PROTOCOL_VERSION = "2025-06-18"
 
 # GitHub allows a JWT to live at most 10 minutes; back-date iat to tolerate
 # clock skew between this machine and GitHub's servers.
@@ -105,8 +119,8 @@ def _check(response: requests.Response, action: str) -> None:
         response.raise_for_status()
 
 
-def get_installation_id(app_jwt: str) -> int:
-    """Return the first installation id for the app."""
+def get_installation(app_jwt: str) -> tuple[int, str]:
+    """Return the ``(id, account_login)`` of the app's first installation."""
     response = requests.get(
         f"{GITHUB_API}/app/installations",
         headers=_auth_headers(app_jwt),
@@ -130,9 +144,10 @@ def get_installation_id(app_jwt: str) -> int:
             account.get("login", "<unknown>"),
         )
 
-    installation_id = installations[0]["id"]
-    logger.info("Using installation id=%s", installation_id)
-    return installation_id
+    installation = installations[0]
+    account_login = (installation.get("account") or {}).get("login", "")
+    logger.info("Using installation id=%s", installation["id"])
+    return installation["id"], account_login
 
 
 def get_installation_token(app_jwt: str, installation_id: int) -> dict:
@@ -146,6 +161,137 @@ def get_installation_token(app_jwt: str, installation_id: int) -> dict:
     return response.json()
 
 
+def _mcp_headers(token: str, session_id: str | None = None) -> dict:
+    """Headers for an MCP Streamable-HTTP request.
+
+    The ``text/event-stream`` accept type is required; the server replies with
+    SSE-framed JSON-RPC. ``Mcp-Session-Id`` is echoed on every call after the
+    initial handshake.
+    """
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json, text/event-stream",
+        "Content-Type": "application/json",
+    }
+    if session_id:
+        headers["Mcp-Session-Id"] = session_id
+    return headers
+
+
+def _parse_mcp_message(response: requests.Response) -> dict | None:
+    """Extract the JSON-RPC message from an MCP HTTP response.
+
+    Handles both a plain JSON body and an SSE stream (``data:`` lines).
+    """
+    if "text/event-stream" in response.headers.get("Content-Type", ""):
+        # Split on the SSE line terminator only. ``str.splitlines()`` would also
+        # break on Unicode separators (NEL, U+2028, ...) that legitimately occur
+        # inside PR bodies, chopping the JSON mid-string. Per SSE, a field's
+        # value is its ``data:`` lines joined with "\n".
+        data = [
+            line[len("data:"):].lstrip(" ")
+            for line in response.text.replace("\r\n", "\n").split("\n")
+            if line.startswith("data:")
+        ]
+        return json.loads("\n".join(data)) if data else None
+    return response.json() if response.text.strip() else None
+
+
+def mcp_initialize(token: str) -> str:
+    """Run the MCP handshake and return the session id."""
+    response = requests.post(
+        MCP_ENDPOINT,
+        headers=_mcp_headers(token),
+        json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": MCP_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {"name": "github-mcp-test", "version": "1.0"},
+            },
+        },
+        timeout=30,
+    )
+    _check(response, "MCP initialize")
+
+    session_id = response.headers.get("Mcp-Session-Id")
+    if not session_id:
+        raise RuntimeError("MCP server did not return an Mcp-Session-Id header.")
+
+    # Tell the server the handshake is complete (fire-and-forget notification).
+    notified = requests.post(
+        MCP_ENDPOINT,
+        headers=_mcp_headers(token, session_id),
+        json={"jsonrpc": "2.0", "method": "notifications/initialized"},
+        timeout=30,
+    )
+    _check(notified, "MCP initialized notification")
+    return session_id
+
+
+def mcp_call_tool(token: str, session_id: str, name: str, arguments: dict) -> dict:
+    """Call an MCP tool and return its ``result`` object."""
+    response = requests.post(
+        MCP_ENDPOINT,
+        headers=_mcp_headers(token, session_id),
+        json={
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {"name": name, "arguments": arguments},
+        },
+        timeout=60,
+    )
+    _check(response, f"MCP tools/call {name}")
+
+    message = _parse_mcp_message(response)
+    if not message:
+        raise RuntimeError(f"Empty response from MCP tool {name}.")
+    if "error" in message:
+        raise RuntimeError(f"MCP tool {name} failed: {message['error']}")
+    return message["result"]
+
+
+def search_closed_prs(token: str, session_id: str, author: str) -> dict:
+    """Search the remote MCP server for the author's closed PRs."""
+    query = f"is:pr author:{author} state:closed"
+    logger.info("MCP search_pull_requests: %s", query)
+    result = mcp_call_tool(
+        token,
+        session_id,
+        "search_pull_requests",
+        {"query": query, "perPage": 100},
+    )
+    # The tool returns its payload as a JSON string in the first text block.
+    for block in result.get("content", []):
+        if block.get("type") == "text":
+            return json.loads(block["text"])
+    return {"total_count": 0, "items": []}
+
+
+def _repo_full_name(pr: dict) -> str:
+    """Pull ``owner/repo`` out of a PR's html_url."""
+    match = re.search(r"github\.com/([^/]+/[^/]+)/", pr.get("html_url", ""))
+    return match.group(1) if match else "<unknown>"
+
+
+def print_closed_prs(search: dict) -> None:
+    """Log a sorted, readable listing of the closed PRs."""
+    items = sorted(search.get("items", []), key=lambda pr: pr.get("html_url", ""))
+    logger.info("Found %d closed PR(s):", search.get("total_count", len(items)))
+    for pr in items:
+        merged = bool((pr.get("pull_request") or {}).get("merged_at"))
+        logger.info(
+            "  #%-4s %-6s %-55s %s",
+            pr.get("number"),
+            "MERGED" if merged else "closed",
+            _repo_full_name(pr),
+            pr.get("title", ""),
+        )
+
+
 def main() -> int:
     load_dotenv()
 
@@ -157,14 +303,22 @@ def main() -> int:
         private_key = fh.read()
 
     app_jwt = generate_jwt(app_id, private_key)
-    installation_id = get_installation_id(app_jwt)
+    installation_id, account_login = get_installation(app_jwt)
     token_data = get_installation_token(app_jwt, installation_id)
 
     token = token_data["token"]
     expires_at = token_data.get("expires_at", "<unknown>")
+    logger.info("Acquired ghs_ token (expires_at=%s).", expires_at)
 
-    logger.info("Installation access token (expires_at=%s):", expires_at)
-    logger.info("%s", token)
+    author = os.environ.get("GITHUB_PR_AUTHOR") or account_login
+    if not author:
+        raise RuntimeError(
+            "Could not determine a PR author. Set GITHUB_PR_AUTHOR explicitly."
+        )
+
+    session_id = mcp_initialize(token)
+    search = search_closed_prs(token, session_id, author)
+    print_closed_prs(search)
     return 0
 
 
