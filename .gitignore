@@ -104,6 +104,8 @@ celerybeat.pid
 
 # Environments
 .env
+.env.*
+!.env.example
 .venv
 env/
 venv/
@@ -150,3 +152,6 @@ Thumbs.db
 
 # Secrets
 *.pem
+*.key
+*.p8
+docs/

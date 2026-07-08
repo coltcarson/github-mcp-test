@@ -1,29 +1,18 @@
-"""Pull your closed pull requests via the GitHub Remote MCP server.
+"""Use a GitHub App installation token with GitHub's remote MCP server.
 
-Runs end to end:
-
-1. Build a short-lived JWT signed (RS256) with the app's private key.
-2. List the app's installations to find an installation id (and account login).
-3. Exchange the JWT for an installation access token (the ``ghs_`` value).
-4. Hand that token to the GitHub Remote MCP server, complete the MCP handshake,
-   and call the ``search_pull_requests`` tool to list closed PRs.
-
-Installation tokens expire one hour after creation, so a fresh one is minted on
-every run. This is a local dev/test utility.
-
-Note: a ``ghs_`` token authenticates as the *app installation*, not as you, so
-the search uses ``author:<login>`` explicitly (``@me`` would resolve to the bot
-and return nothing). The author defaults to the installation account; override
-it with ``GITHUB_PR_AUTHOR``.
+The program signs a short-lived GitHub App JWT, exchanges it for an
+installation access token restricted to one repository, initializes a
+read-only MCP session, and calls the ``search_pull_requests`` tool.
 """
 
-import glob
 import json
 import logging
 import os
 import re
 import sys
 import time
+from argparse import ArgumentParser, Namespace
+from typing import Any
 
 import jwt
 import requests
@@ -33,63 +22,55 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
 )
-logger = logging.getLogger("github-app-token")
+logger = logging.getLogger("github-app-mcp")
 
 GITHUB_API = "https://api.github.com"
-API_VERSION = "2022-11-28"
-ACCEPT = "application/vnd.github+json"
-
-# GitHub's hosted (remote) MCP server. It forwards the bearer token straight to
-# the GitHub API, so any valid token -- including a ``ghs_`` installation token
-# -- works here.
+GITHUB_API_VERSION = "2026-03-10"
+GITHUB_ACCEPT = "application/vnd.github+json"
 MCP_ENDPOINT = "https://api.githubcopilot.com/mcp/"
 MCP_PROTOCOL_VERSION = "2025-06-18"
+MCP_TOOL = "search_pull_requests"
 
-# GitHub allows a JWT to live at most 10 minutes; back-date iat to tolerate
-# clock skew between this machine and GitHub's servers.
 JWT_LIFETIME_SECONDS = 600
 JWT_CLOCK_SKEW_SECONDS = 60
-
-
-def find_private_key_path() -> str:
-    """Return the path to the GitHub App private key.
-
-    Uses ``GITHUB_APP_PRIVATE_KEY_PATH`` if set, otherwise auto-detects a
-    single ``*.pem`` file in the project root.
-    """
-    override = os.environ.get("GITHUB_APP_PRIVATE_KEY_PATH")
-    if override:
-        if not os.path.isfile(override):
-            raise FileNotFoundError(
-                f"GITHUB_APP_PRIVATE_KEY_PATH points to a missing file: {override}"
-            )
-        return override
-
-    root = os.path.dirname(os.path.abspath(__file__))
-    pem_files = sorted(glob.glob(os.path.join(root, "*.pem")))
-    if not pem_files:
-        raise FileNotFoundError(
-            "No *.pem private key found in the project root. "
-            "Add your GitHub App private key, or set GITHUB_APP_PRIVATE_KEY_PATH."
-        )
-    if len(pem_files) > 1:
-        names = ", ".join(os.path.basename(p) for p in pem_files)
-        raise RuntimeError(
-            f"Multiple *.pem files found ({names}). "
-            "Set GITHUB_APP_PRIVATE_KEY_PATH to choose one."
-        )
-    return pem_files[0]
+REPOSITORY_PATTERN = re.compile(
+    r"^(?P<owner>[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?)/"
+    r"(?P<repo>[A-Za-z0-9_.-]+)$"
+)
 
 
 def require_env(name: str) -> str:
-    value = os.environ.get(name)
+    """Return a required environment variable without logging its value."""
+    value = os.environ.get(name, "").strip()
     if not value:
         raise RuntimeError(f"Missing required environment variable: {name}")
     return value
 
 
+def validate_repository(value: str) -> tuple[str, str]:
+    """Validate and split an ``owner/repository`` argument."""
+    match = REPOSITORY_PATTERN.fullmatch(value.strip())
+    if not match:
+        raise ValueError("--repo must use the owner/repository format.")
+    return match.group("owner"), match.group("repo")
+
+
+def read_private_key() -> str:
+    """Read the explicitly configured private key without exposing its path."""
+    path = require_env("GITHUB_APP_PRIVATE_KEY_PATH")
+    if not os.path.isfile(path):
+        raise RuntimeError(
+            "GITHUB_APP_PRIVATE_KEY_PATH does not reference a readable file."
+        )
+    try:
+        with open(path, "r", encoding="utf-8") as private_key_file:
+            return private_key_file.read()
+    except OSError as exc:
+        raise RuntimeError("Unable to read the configured GitHub App private key.") from exc
+
+
 def generate_jwt(app_id: str, private_key: str) -> str:
-    """Build a JWT signed with the app private key (RS256)."""
+    """Build a short-lived RS256 JWT for GitHub App authentication."""
     now = int(time.time())
     payload = {
         "iat": now - JWT_CLOCK_SKEW_SECONDS,
@@ -99,106 +80,96 @@ def generate_jwt(app_id: str, private_key: str) -> str:
     return jwt.encode(payload, private_key, algorithm="RS256")
 
 
-def _auth_headers(token: str) -> dict:
+def _github_headers(token: str) -> dict[str, str]:
     return {
         "Authorization": f"Bearer {token}",
-        "Accept": ACCEPT,
-        "X-GitHub-Api-Version": API_VERSION,
+        "Accept": GITHUB_ACCEPT,
+        "X-GitHub-Api-Version": GITHUB_API_VERSION,
     }
 
 
-def _check(response: requests.Response, action: str) -> None:
-    if not response.ok:
-        logger.error(
-            "%s failed: %s %s -- %s",
-            action,
-            response.status_code,
-            response.reason,
-            response.text,
-        )
-        response.raise_for_status()
-
-
-def get_installation(app_jwt: str) -> tuple[int, str]:
-    """Return the ``(id, account_login)`` of the app's first installation."""
-    response = requests.get(
-        f"{GITHUB_API}/app/installations",
-        headers=_auth_headers(app_jwt),
-        timeout=30,
-    )
-    _check(response, "Listing installations")
-
-    installations = response.json()
-    if not installations:
-        raise RuntimeError(
-            "This GitHub App has no installations. "
-            "Install it on a user or organization account first."
-        )
-
-    logger.info("Found %d installation(s).", len(installations))
-    for inst in installations:
-        account = inst.get("account") or {}
-        logger.info(
-            "  installation id=%s account=%s",
-            inst.get("id"),
-            account.get("login", "<unknown>"),
-        )
-
-    installation = installations[0]
-    account_login = (installation.get("account") or {}).get("login", "")
-    logger.info("Using installation id=%s", installation["id"])
-    return installation["id"], account_login
-
-
-def get_installation_token(app_jwt: str, installation_id: int) -> dict:
-    """Create an installation access token (the ``ghs_`` token)."""
-    response = requests.post(
-        f"{GITHUB_API}/app/installations/{installation_id}/access_tokens",
-        headers=_auth_headers(app_jwt),
-        timeout=30,
-    )
-    _check(response, "Creating installation access token")
-    return response.json()
-
-
-def _mcp_headers(token: str, session_id: str | None = None) -> dict:
-    """Headers for an MCP Streamable-HTTP request.
-
-    The ``text/event-stream`` accept type is required; the server replies with
-    SSE-framed JSON-RPC. ``Mcp-Session-Id`` is echoed on every call after the
-    initial handshake.
-    """
+def _mcp_headers(token: str, session_id: str | None = None) -> dict[str, str]:
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/json, text/event-stream",
         "Content-Type": "application/json",
+        "X-MCP-Readonly": "true",
+        "X-MCP-Tools": MCP_TOOL,
     }
     if session_id:
         headers["Mcp-Session-Id"] = session_id
     return headers
 
 
-def _parse_mcp_message(response: requests.Response) -> dict | None:
-    """Extract the JSON-RPC message from an MCP HTTP response.
+def _check_response(response: requests.Response, action: str) -> None:
+    """Raise a sanitized HTTP error without logging response or request bodies."""
+    if response.ok:
+        return
+    reason = response.reason or "request failed"
+    raise RuntimeError(f"{action} failed with HTTP {response.status_code} {reason}.")
 
-    Handles both a plain JSON body and an SSE stream (``data:`` lines).
-    """
-    if "text/event-stream" in response.headers.get("Content-Type", ""):
-        # Split on the SSE line terminator only. ``str.splitlines()`` would also
-        # break on Unicode separators (NEL, U+2028, ...) that legitimately occur
-        # inside PR bodies, chopping the JSON mid-string. Per SSE, a field's
-        # value is its ``data:`` lines joined with "\n".
-        data = [
-            line[len("data:"):].lstrip(" ")
-            for line in response.text.replace("\r\n", "\n").split("\n")
+
+def get_installation_token(
+    app_jwt: str,
+    installation_id: str,
+    repository_name: str,
+) -> dict[str, Any]:
+    """Mint a token limited to one repository and read-only PR access."""
+    response = requests.post(
+        f"{GITHUB_API}/app/installations/{installation_id}/access_tokens",
+        headers=_github_headers(app_jwt),
+        json={
+            "repositories": [repository_name],
+            "permissions": {"pull_requests": "read"},
+        },
+        timeout=30,
+    )
+    _check_response(response, "Creating the installation access token")
+    payload = response.json()
+    if not isinstance(payload.get("token"), str) or not payload["token"]:
+        raise RuntimeError("GitHub returned an invalid installation token response.")
+    return payload
+
+
+def _parse_mcp_message(response: requests.Response) -> dict[str, Any] | None:
+    """Parse a plain JSON or server-sent-event MCP response."""
+    if not response.text.strip():
+        return None
+
+    if "text/event-stream" not in response.headers.get("Content-Type", ""):
+        return response.json()
+
+    normalized = response.text.replace("\r\n", "\n").replace("\r", "\n")
+    messages: list[dict[str, Any]] = []
+    for event in normalized.split("\n\n"):
+        data_lines = [
+            line[len("data:") :].lstrip(" ")
+            for line in event.split("\n")
             if line.startswith("data:")
         ]
-        return json.loads("\n".join(data)) if data else None
-    return response.json() if response.text.strip() else None
+        if data_lines:
+            messages.append(json.loads("\n".join(data_lines)))
+    return messages[-1] if messages else None
+
+
+def _mcp_result(response: requests.Response, action: str) -> dict[str, Any]:
+    _check_response(response, action)
+    message = _parse_mcp_message(response)
+    if not message:
+        raise RuntimeError(f"{action} returned an empty MCP response.")
+    if "error" in message:
+        error = message["error"]
+        code = error.get("code", "unknown") if isinstance(error, dict) else "unknown"
+        raise RuntimeError(f"{action} returned MCP error code {code}.")
+    result = message.get("result")
+    if not isinstance(result, dict):
+        raise RuntimeError(f"{action} returned an invalid MCP result.")
+    return result
 
 
 def mcp_initialize(token: str) -> str:
-    """Run the MCP handshake and return the session id."""
+    """Complete the MCP handshake and return its session identifier."""
+    logger.info("Initializing the remote GitHub MCP session.")
     response = requests.post(
         MCP_ENDPOINT,
         headers=_mcp_headers(token),
@@ -209,122 +180,148 @@ def mcp_initialize(token: str) -> str:
             "params": {
                 "protocolVersion": MCP_PROTOCOL_VERSION,
                 "capabilities": {},
-                "clientInfo": {"name": "github-mcp-test", "version": "1.0"},
+                "clientInfo": {"name": "github-app-remote-mcp-demo", "version": "1.0"},
             },
         },
         timeout=30,
     )
-    _check(response, "MCP initialize")
+    _mcp_result(response, "MCP initialize")
 
     session_id = response.headers.get("Mcp-Session-Id")
     if not session_id:
-        raise RuntimeError("MCP server did not return an Mcp-Session-Id header.")
+        raise RuntimeError("MCP initialize did not return a session identifier.")
 
-    # Tell the server the handshake is complete (fire-and-forget notification).
-    notified = requests.post(
+    notification = requests.post(
         MCP_ENDPOINT,
         headers=_mcp_headers(token, session_id),
         json={"jsonrpc": "2.0", "method": "notifications/initialized"},
         timeout=30,
     )
-    _check(notified, "MCP initialized notification")
+    _check_response(notification, "MCP initialized notification")
     return session_id
 
 
-def mcp_call_tool(token: str, session_id: str, name: str, arguments: dict) -> dict:
-    """Call an MCP tool and return its ``result`` object."""
+def mcp_list_tools(token: str, session_id: str) -> list[dict[str, Any]]:
+    """List tools exposed by the restricted MCP session."""
+    response = requests.post(
+        MCP_ENDPOINT,
+        headers=_mcp_headers(token, session_id),
+        json={"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+        timeout=30,
+    )
+    result = _mcp_result(response, "MCP tools/list")
+    tools = result.get("tools", [])
+    if not isinstance(tools, list):
+        raise RuntimeError("MCP tools/list returned an invalid tool collection.")
+    return tools
+
+
+def mcp_search_closed_pull_requests(
+    token: str,
+    session_id: str,
+    repository: str,
+) -> dict[str, Any]:
+    """Call the MCP search tool for closed pull requests in one repository."""
     response = requests.post(
         MCP_ENDPOINT,
         headers=_mcp_headers(token, session_id),
         json={
             "jsonrpc": "2.0",
-            "id": 2,
+            "id": 3,
             "method": "tools/call",
-            "params": {"name": name, "arguments": arguments},
+            "params": {
+                "name": MCP_TOOL,
+                "arguments": {
+                    "query": f"repo:{repository} is:pr state:closed",
+                    "perPage": 100,
+                },
+            },
         },
         timeout=60,
     )
-    _check(response, f"MCP tools/call {name}")
-
-    message = _parse_mcp_message(response)
-    if not message:
-        raise RuntimeError(f"Empty response from MCP tool {name}.")
-    if "error" in message:
-        raise RuntimeError(f"MCP tool {name} failed: {message['error']}")
-    return message["result"]
-
-
-def search_closed_prs(token: str, session_id: str, author: str) -> dict:
-    """Search the remote MCP server for the author's closed PRs."""
-    query = f"is:pr author:{author} state:closed"
-    logger.info("MCP search_pull_requests: %s", query)
-    result = mcp_call_tool(
-        token,
-        session_id,
-        "search_pull_requests",
-        {"query": query, "perPage": 100},
-    )
-    # The tool returns its payload as a JSON string in the first text block.
+    result = _mcp_result(response, f"MCP tools/call {MCP_TOOL}")
     for block in result.get("content", []):
         if block.get("type") == "text":
-            return json.loads(block["text"])
-    return {"total_count": 0, "items": []}
+            parsed = json.loads(block.get("text", "{}"))
+            return parsed if isinstance(parsed, dict) else {"items": []}
+    return {"items": []}
 
 
-def _repo_full_name(pr: dict) -> str:
-    """Pull ``owner/repo`` out of a PR's html_url."""
-    match = re.search(r"github\.com/([^/]+/[^/]+)/", pr.get("html_url", ""))
-    return match.group(1) if match else "<unknown>"
-
-
-def print_closed_prs(search: dict) -> None:
-    """Log a sorted, readable listing of the closed PRs."""
-    items = sorted(search.get("items", []), key=lambda pr: pr.get("html_url", ""))
-    logger.info("Found %d closed PR(s):", search.get("total_count", len(items)))
-    for pr in items:
-        merged = bool((pr.get("pull_request") or {}).get("merged_at"))
+def print_pull_requests(search_result: dict[str, Any]) -> None:
+    """Print a concise, credential-free result summary."""
+    items = search_result.get("items", [])
+    total = search_result.get("total_count", len(items))
+    logger.info("Found %s closed pull request(s).", total)
+    for pull_request in items:
         logger.info(
-            "  #%-4s %-6s %-55s %s",
-            pr.get("number"),
-            "MERGED" if merged else "closed",
-            _repo_full_name(pr),
-            pr.get("title", ""),
+            "#%-5s %s",
+            pull_request.get("number", "?"),
+            pull_request.get("title", "<untitled>"),
         )
+
+
+def run(repository: str) -> int:
+    _, repository_name = validate_repository(repository)
+    app_id = require_env("GITHUB_APP_ID")
+    installation_id = require_env("GITHUB_INSTALLATION_ID")
+    private_key = read_private_key()
+
+    app_jwt = generate_jwt(app_id, private_key)
+    token_data = get_installation_token(
+        app_jwt,
+        installation_id,
+        repository_name,
+    )
+    installation_token = token_data["token"]
+    logger.info(
+        "Acquired an installation token (expires_at=%s).",
+        token_data.get("expires_at", "<unknown>"),
+    )
+
+    session_id = mcp_initialize(installation_token)
+    tools = mcp_list_tools(installation_token, session_id)
+    advertised_names = {
+        tool.get("name") for tool in tools if isinstance(tool, dict)
+    }
+    if MCP_TOOL not in advertised_names:
+        raise RuntimeError(
+            f"The remote MCP server did not advertise the required {MCP_TOOL} tool."
+        )
+
+    search_result = mcp_search_closed_pull_requests(
+        installation_token,
+        session_id,
+        repository,
+    )
+    print_pull_requests(search_result)
+    return 0
+
+
+def parse_args() -> Namespace:
+    parser = ArgumentParser(
+        description=(
+            "Search closed pull requests through GitHub's remote MCP server "
+            "using a GitHub App installation token."
+        )
+    )
+    parser.add_argument(
+        "--repo",
+        required=True,
+        metavar="OWNER/REPOSITORY",
+        help="Repository installed for the GitHub App.",
+    )
+    return parser.parse_args()
 
 
 def main() -> int:
-    load_dotenv()
-
-    app_id = require_env("GITHUB_APP_ID")
-    private_key_path = find_private_key_path()
-    logger.info("Using private key: %s", os.path.basename(private_key_path))
-
-    with open(private_key_path, "r", encoding="utf-8") as fh:
-        private_key = fh.read()
-
-    app_jwt = generate_jwt(app_id, private_key)
-    installation_id, account_login = get_installation(app_jwt)
-    token_data = get_installation_token(app_jwt, installation_id)
-
-    token = token_data["token"]
-    expires_at = token_data.get("expires_at", "<unknown>")
-    logger.info("Acquired ghs_ token (expires_at=%s).", expires_at)
-
-    author = os.environ.get("GITHUB_PR_AUTHOR") or account_login
-    if not author:
-        raise RuntimeError(
-            "Could not determine a PR author. Set GITHUB_PR_AUTHOR explicitly."
-        )
-
-    session_id = mcp_initialize(token)
-    search = search_closed_prs(token, session_id, author)
-    print_closed_prs(search)
-    return 0
+    load_dotenv(override=False)
+    args = parse_args()
+    return run(args.repo)
 
 
 if __name__ == "__main__":
     try:
         sys.exit(main())
-    except Exception as exc:  # noqa: BLE001 - surface a clean message to the logs
+    except Exception as exc:  # noqa: BLE001 - return a concise CLI error
         logger.error("%s", exc)
         sys.exit(1)
